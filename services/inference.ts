@@ -2,7 +2,6 @@ import { Platform } from 'react-native';
 import { GrainCounts, KernelShape, ColorProfile, RiceType } from '@/types';
 import {
   MODEL_URL,
-  MODEL_VERSION,
   GRID_COLS,
   GRID_ROWS,
   N_TILES,
@@ -17,7 +16,7 @@ import {
   getRiceTypeMeta,
 } from '@/constants/model';
 
-export { MODEL_VERSION };
+export const MODEL_VERSION = 'ultimate_tiled_multitask_v1.0_onnx_int8';
 
 export interface InferenceResult {
   grainCounts: GrainCounts;
@@ -26,13 +25,45 @@ export interface InferenceResult {
   processingTimeMs: number;
 }
 
-let cachedSession: any = null;
-let modelLoadPromise: Promise<any> | null = null;
+const FULL_W = TILE_SIZE * GRID_COLS;
+const FULL_H = TILE_SIZE * GRID_ROWS;
+
+const COUNT_COLS = [
+  'Count', 'Broken_Count', 'Long_Count', 'Medium_Count', 'Black_Count',
+  'Chalky_Count', 'Red_Count', 'Yellow_Count', 'Green_Count',
+];
+
+const PADDY_ZERO_COLS = ['Chalky_Count', 'Medium_Count', 'Yellow_Count', 'Green_Count'];
+const BROWN_ZERO_COLS = ['Green_Count'];
+
+const RICE_MAP: Record<RiceType, number> = { Paddy: 0, White: 1, Brown: 2 };
+
+let cachedNativeSession: any = null;
+let nativeModelLoadPromise: Promise<any> | null = null;
 let nativeOrt: any = null;
 let nativeOrtAvailable: boolean | null = null;
 
 let webOrt: any = null;
 let webOrtLoadAttempted = false;
+let cachedWebSession: any = null;
+let webModelLoadPromise: Promise<any> | null = null;
+
+function getNativeOrt(): any {
+  if (nativeOrtAvailable === false) return null;
+  if (nativeOrt) return nativeOrt;
+
+  try {
+    const moduleName = 'onnxruntime-react-native';
+    nativeOrt = require(moduleName);
+    nativeOrtAvailable = true;
+    console.log('[Inference] onnxruntime-react-native loaded successfully');
+    return nativeOrt;
+  } catch (e) {
+    console.log('[Inference] onnxruntime-react-native not available, will use simulation fallback');
+    nativeOrtAvailable = false;
+    return null;
+  }
+}
 
 async function loadWebOrtDynamic(): Promise<any> {
   if (webOrt) return webOrt;
@@ -61,28 +92,44 @@ async function loadWebOrtDynamic(): Promise<any> {
   }
 }
 
-function getNativeOrt(): any {
-  if (nativeOrtAvailable === false) return null;
-  if (nativeOrt) return nativeOrt;
+async function loadNativeSession(): Promise<any> {
+  if (cachedNativeSession) return cachedNativeSession;
+  if (nativeModelLoadPromise) return nativeModelLoadPromise;
 
-  try {
-    const moduleName = 'onnxruntime-react-native';
-    nativeOrt = require(moduleName);
-    nativeOrtAvailable = true;
-    console.log('[Inference] onnxruntime-react-native loaded successfully');
-    return nativeOrt;
-  } catch (e) {
-    console.log('[Inference] onnxruntime-react-native not available, will use simulation fallback');
-    nativeOrtAvailable = false;
-    return null;
-  }
+  nativeModelLoadPromise = (async () => {
+    try {
+      const ort = getNativeOrt();
+      if (!ort) throw new Error('onnxruntime-react-native not available');
+
+      console.log('[Inference] Loading ONNX model on native...');
+
+      const response = await fetch(MODEL_URL);
+      if (!response.ok) {
+        throw new Error(`Failed to fetch model: ${response.status} ${response.statusText}`);
+      }
+      const buffer = await response.arrayBuffer();
+      console.log('[Inference] Model downloaded:', (buffer.byteLength / 1e6).toFixed(1), 'MB');
+
+      const session = await ort.InferenceSession.create(buffer, {
+        executionProviders: ['cpu'],
+      });
+      console.log('[Inference] Native session created. Inputs:', session.inputNames, 'Outputs:', session.outputNames);
+      cachedNativeSession = session;
+      return session;
+    } catch (err) {
+      nativeModelLoadPromise = null;
+      throw err;
+    }
+  })();
+
+  return nativeModelLoadPromise;
 }
 
 async function loadWebSession(): Promise<any> {
-  if (cachedSession) return cachedSession;
-  if (modelLoadPromise) return modelLoadPromise;
+  if (cachedWebSession) return cachedWebSession;
+  if (webModelLoadPromise) return webModelLoadPromise;
 
-  modelLoadPromise = (async () => {
+  webModelLoadPromise = (async () => {
     try {
       console.log('[Inference] Loading onnxruntime-web...');
       const ort = await loadWebOrtDynamic();
@@ -99,58 +146,75 @@ async function loadWebSession(): Promise<any> {
       const buffer = await response.arrayBuffer();
       console.log('[Inference] Model downloaded:', (buffer.byteLength / 1e6).toFixed(1), 'MB');
 
-      console.log('[Inference] Creating inference session...');
       const session = await ort.InferenceSession.create(buffer, {
         executionProviders: ['wasm'],
         graphOptimizationLevel: 'all',
       });
 
-      console.log('[Inference] Session created. Inputs:', session.inputNames, 'Outputs:', session.outputNames);
-      cachedSession = session;
+      console.log('[Inference] Web session created. Inputs:', session.inputNames, 'Outputs:', session.outputNames);
+      cachedWebSession = session;
       return session;
     } catch (err) {
-      modelLoadPromise = null;
+      webModelLoadPromise = null;
       throw err;
     }
   })();
 
-  return modelLoadPromise;
+  return webModelLoadPromise;
 }
 
-async function loadNativeSession(): Promise<any> {
-  if (cachedSession) return cachedSession;
-  if (modelLoadPromise) return modelLoadPromise;
+async function buildTileTensorNative(imageUri: string): Promise<Float32Array> {
+  console.log('[Inference] Preprocessing image (native) via expo-image-manipulator + jpeg-js...');
 
-  modelLoadPromise = (async () => {
-    try {
-      const ort = getNativeOrt();
-      if (!ort) throw new Error('onnxruntime-react-native not available');
+  const ImageManipulator = require('expo-image-manipulator');
+  const jpeg = require('jpeg-js');
 
-      console.log('[Inference] Loading ONNX model on native...');
+  const resized = await ImageManipulator.manipulateAsync(
+    imageUri,
+    [{ resize: { width: FULL_W, height: FULL_H } }],
+    { compress: 1.0, format: ImageManipulator.SaveFormat.JPEG, base64: true }
+  );
 
-      const response = await fetch(MODEL_URL);
-      if (!response.ok) {
-        throw new Error(`Failed to fetch model: ${response.status} ${response.statusText}`);
+  if (!resized.base64) throw new Error('expo-image-manipulator did not return base64 data');
+
+  const binaryStr = atob(resized.base64);
+  const jpegBytes = new Uint8Array(binaryStr.length);
+  for (let i = 0; i < binaryStr.length; i++) {
+    jpegBytes[i] = binaryStr.charCodeAt(i);
+  }
+
+  const { data: rgba } = jpeg.decode(jpegBytes, { useTArray: true });
+
+  const tilePixels = TILE_SIZE * TILE_SIZE;
+  const tensorData = new Float32Array(N_TILES * 3 * tilePixels);
+
+  for (let tileIdx = 0; tileIdx < N_TILES; tileIdx++) {
+    const tileRow = Math.floor(tileIdx / GRID_COLS);
+    const tileCol = tileIdx % GRID_COLS;
+    const tileBase = tileIdx * 3 * tilePixels;
+
+    for (let ty = 0; ty < TILE_SIZE; ty++) {
+      const imgY = tileRow * TILE_SIZE + ty;
+      for (let tx = 0; tx < TILE_SIZE; tx++) {
+        const imgX = tileCol * TILE_SIZE + tx;
+        const srcIdx = (imgY * FULL_W + imgX) * 4;
+        const dstPx = ty * TILE_SIZE + tx;
+
+        for (let c = 0; c < 3; c++) {
+          const pixel = rgba[srcIdx + c] / 255.0;
+          tensorData[tileBase + c * tilePixels + dstPx] = (pixel - NORM_MEAN[c]) / NORM_STD[c];
+        }
       }
-      const buffer = await response.arrayBuffer();
-      console.log('[Inference] Model downloaded:', (buffer.byteLength / 1e6).toFixed(1), 'MB');
-
-      const session = await ort.InferenceSession.create(buffer);
-      console.log('[Inference] Native session created. Inputs:', session.inputNames, 'Outputs:', session.outputNames);
-      cachedSession = session;
-      return session;
-    } catch (err) {
-      modelLoadPromise = null;
-      throw err;
     }
-  })();
+  }
 
-  return modelLoadPromise;
+  console.log('[Inference] Native preprocessing complete. Tensor size:', tensorData.length);
+  return tensorData;
 }
 
-function preprocessImageWeb(imageUri: string): Promise<Float32Array> {
+function buildTileTensorWeb(imageUri: string): Promise<Float32Array> {
   return new Promise((resolve, reject) => {
-    console.log('[Inference] Preprocessing image for ONNX (web)...');
+    console.log('[Inference] Preprocessing image (web) via canvas...');
 
     const img = new Image();
     img.crossOrigin = 'anonymous';
@@ -211,7 +275,7 @@ function preprocessImageWeb(imageUri: string): Promise<Float32Array> {
           }
         }
 
-        console.log('[Inference] Preprocessing complete. Tensor size:', tilesData.length);
+        console.log('[Inference] Web preprocessing complete. Tensor size:', tilesData.length);
         resolve(tilesData);
       } catch (err) {
         reject(err);
@@ -223,92 +287,46 @@ function preprocessImageWeb(imageUri: string): Promise<Float32Array> {
   });
 }
 
-async function preprocessImageNative(imageUri: string): Promise<Float32Array> {
-  console.log('[Inference] Preprocessing image for ONNX (native)...');
-
-  const response = await fetch(imageUri);
-  const blob = await response.blob();
-
-  const reader = new FileReader();
-  const base64 = await new Promise<string>((resolve, reject) => {
-    reader.onload = () => {
-      const result = reader.result as string;
-      resolve(result);
-    };
-    reader.onerror = reject;
-    reader.readAsDataURL(blob);
-  });
-
-  const img = await new Promise<{ width: number; height: number; pixels: Uint8Array }>((resolve, reject) => {
-    try {
-      const { Image: ExpoImage } = require('expo-image');
-      console.log('[Inference] Using expo-image for pixel extraction (native fallback)');
-      reject(new Error('Direct pixel access not available on native'));
-    } catch {
-      reject(new Error('Image pixel extraction not available on native'));
-    }
-  }).catch(() => {
-    console.log('[Inference] Native pixel extraction unavailable, using canvas-free approach');
-    return null;
-  });
-
-  if (!img) {
-    throw new Error('Cannot preprocess image on native without pixel access. Please use the web version or build with onnxruntime-react-native + expo-dev-client.');
-  }
-
-  const totalFloats = N_TILES * 3 * TILE_SIZE * TILE_SIZE;
-  return new Float32Array(totalFloats);
-}
-
 function postprocessResults(rawCounts: Float32Array, rawMeasures: Float32Array, riceType: RiceType): { grainCounts: GrainCounts; kernelShape: KernelShape; colorProfile: ColorProfile } {
   console.log('[Inference] Raw counts:', Array.from(rawCounts));
   console.log('[Inference] Raw measures:', Array.from(rawMeasures));
 
-  const counts = new Float32Array(9);
-  for (let i = 0; i < 9; i++) {
-    counts[i] = rawCounts[i] / SCALE;
-  }
+  const riceTypeIdx = RICE_MAP[riceType];
+  const countMap: Record<string, number> = {};
 
-  const riceTypeIdx = riceType === 'Paddy' ? 0 : riceType === 'Brown' ? 2 : 1;
-  if (riceTypeIdx === 0) {
-    for (const idx of PADDY_ZERO_INDICES) {
-      counts[idx] = 0;
+  for (let i = 0; i < COUNT_COLS.length; i++) {
+    const col = COUNT_COLS[i];
+    let val = rawCounts[i] / SCALE;
+    if (
+      (riceTypeIdx === 0 && PADDY_ZERO_COLS.includes(col)) ||
+      (riceTypeIdx === 2 && BROWN_ZERO_COLS.includes(col))
+    ) {
+      val = 0;
     }
-  } else if (riceTypeIdx === 2) {
-    for (const idx of BROWN_ZERO_INDICES) {
-      counts[idx] = 0;
-    }
+    countMap[col] = Math.max(0, Math.round(val));
   }
 
-  for (let i = 0; i < 9; i++) {
-    counts[i] = Math.max(0, Math.round(counts[i]));
-  }
-
-  const measures = new Float32Array(6);
-  for (let i = 0; i < 6; i++) {
-    measures[i] = rawMeasures[i] * (M_STATS_STD[i] + 1e-8) + M_STATS_MEAN[i];
+  const measures: number[] = [];
+  for (let i = 0; i < M_STATS_MEAN.length; i++) {
+    measures.push(rawMeasures[i] * (M_STATS_STD[i] + 1e-8) + M_STATS_MEAN[i]);
   }
 
   const grainCounts: GrainCounts = {
-    total: counts[0],
-    broken: counts[1],
-    long: counts[2],
-    medium: counts[3],
-    black: counts[4],
-    chalky: counts[5],
-    red: counts[6],
-    yellow: counts[7],
-    green: counts[8],
+    total: countMap['Count'],
+    broken: countMap['Broken_Count'],
+    long: countMap['Long_Count'],
+    medium: countMap['Medium_Count'],
+    black: countMap['Black_Count'],
+    chalky: countMap['Chalky_Count'],
+    red: countMap['Red_Count'],
+    yellow: countMap['Yellow_Count'],
+    green: countMap['Green_Count'],
   };
 
-  const lengthAvg = Math.round(measures[0] * 100) / 100;
-  const widthAvg = Math.round(measures[1] * 100) / 100;
-  const lwRatio = widthAvg > 0 ? Math.round((lengthAvg / widthAvg) * 100) / 100 : measures[2];
-
   const kernelShape: KernelShape = {
-    lengthAvg: Math.max(0, lengthAvg),
-    widthAvg: Math.max(0, widthAvg),
-    lwRatio: Math.max(0, lwRatio),
+    lengthAvg: Math.round(measures[0] * 100) / 100,
+    widthAvg: Math.round(measures[1] * 100) / 100,
+    lwRatio: Math.round(measures[2] * 100) / 100,
   };
 
   const colorProfile: ColorProfile = {
@@ -320,21 +338,63 @@ function postprocessResults(rawCounts: Float32Array, rawMeasures: Float32Array, 
   return { grainCounts, kernelShape, colorProfile };
 }
 
+async function runOnnxNativeInference(imageUri: string, riceType: RiceType): Promise<InferenceResult> {
+  const startTime = Date.now();
+  const riceTypeIdx = RICE_MAP[riceType];
+  console.log('[Inference] Starting ONNX Native inference, rice type:', riceType);
+
+  const [session, tilesData] = await Promise.all([
+    loadNativeSession(),
+    buildTileTensorNative(imageUri),
+  ]);
+
+  const ort = getNativeOrt();
+  if (!ort) throw new Error('onnxruntime-react-native not loaded');
+
+  const metaData = new Float32Array(3);
+  metaData[riceTypeIdx] = 1.0;
+
+  const feeds = {
+    tiles: new ort.Tensor('float32', tilesData, [N_TILES, 3, TILE_SIZE, TILE_SIZE]),
+    meta: new ort.Tensor('float32', metaData, [1, 3]),
+  };
+
+  console.log('[Inference] Running native model...');
+  const results = await session.run(feeds);
+  console.log('[Inference] Model output keys:', Object.keys(results));
+
+  const rawCounts = results['counts'].data as Float32Array;
+  const rawMeasures = results['measures'].data as Float32Array;
+
+  const { grainCounts, kernelShape, colorProfile } = postprocessResults(rawCounts, rawMeasures, riceType);
+  const processingTimeMs = Date.now() - startTime;
+
+  console.log('[Inference] ONNX Native inference complete in', processingTimeMs, 'ms');
+  console.log('[Inference] Grain counts:', grainCounts);
+  console.log('[Inference] Kernel shape:', kernelShape);
+  console.log('[Inference] Color profile:', colorProfile);
+
+  return { grainCounts, kernelShape, colorProfile, processingTimeMs };
+}
+
 async function runOnnxWebInference(imageUri: string, riceType: RiceType): Promise<InferenceResult> {
   const startTime = Date.now();
-  console.log('[Inference] Starting ONNX Web inference for rice type:', riceType);
+  const riceTypeIdx = RICE_MAP[riceType];
+  console.log('[Inference] Starting ONNX Web inference, rice type:', riceType);
 
   const session = await loadWebSession();
   const ort = webOrt;
   if (!ort) throw new Error('onnxruntime-web not loaded');
 
-  const tilesData = await preprocessImageWeb(imageUri);
+  const tilesData = await buildTileTensorWeb(imageUri);
+
+  const metaData = new Float32Array(3);
+  metaData[riceTypeIdx] = 1.0;
+
   const tilesTensor = new ort.Tensor('float32', tilesData, [N_TILES, 3, TILE_SIZE, TILE_SIZE]);
+  const metaTensor = new ort.Tensor('float32', metaData, [1, 3]);
 
-  const metaValues = getRiceTypeMeta(riceType);
-  const metaTensor = new ort.Tensor('float32', new Float32Array(metaValues), [1, 3]);
-
-  console.log('[Inference] Running model...');
+  console.log('[Inference] Running web model...');
   const feeds: Record<string, any> = {
     tiles: tilesTensor,
     meta: metaTensor,
@@ -354,38 +414,6 @@ async function runOnnxWebInference(imageUri: string, riceType: RiceType): Promis
   console.log('[Inference] Kernel shape:', kernelShape);
   console.log('[Inference] Color profile:', colorProfile);
 
-  return { grainCounts, kernelShape, colorProfile, processingTimeMs };
-}
-
-async function runOnnxNativeInference(imageUri: string, riceType: RiceType): Promise<InferenceResult> {
-  const startTime = Date.now();
-  console.log('[Inference] Starting ONNX Native inference for rice type:', riceType);
-
-  const session = await loadNativeSession();
-  const ort = getNativeOrt();
-
-  const tilesData = await preprocessImageNative(imageUri);
-  const tilesTensor = new ort.Tensor('float32', tilesData, [N_TILES, 3, TILE_SIZE, TILE_SIZE]);
-
-  const metaValues = getRiceTypeMeta(riceType);
-  const metaTensor = new ort.Tensor('float32', new Float32Array(metaValues), [1, 3]);
-
-  console.log('[Inference] Running native model...');
-  const feeds: Record<string, any> = {
-    tiles: tilesTensor,
-    meta: metaTensor,
-  };
-
-  const results = await session.run(feeds);
-  console.log('[Inference] Model output keys:', Object.keys(results));
-
-  const rawCounts = results['counts'].data as Float32Array;
-  const rawMeasures = results['measures'].data as Float32Array;
-
-  const { grainCounts, kernelShape, colorProfile } = postprocessResults(rawCounts, rawMeasures, riceType);
-  const processingTimeMs = Date.now() - startTime;
-
-  console.log('[Inference] ONNX Native inference complete in', processingTimeMs, 'ms');
   return { grainCounts, kernelShape, colorProfile, processingTimeMs };
 }
 

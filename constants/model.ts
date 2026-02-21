@@ -14,8 +14,8 @@ export const SCALE = 100.0;
 export const NORM_MEAN = [0.485, 0.456, 0.406];
 export const NORM_STD = [0.229, 0.224, 0.225];
 
-export const M_STATS_MEAN = [6.8, 2.3, 3.1, 71.0, 1.8, 15.5];
-export const M_STATS_STD = [1.1, 0.4, 0.7, 7.5, 2.2, 4.5];
+export const M_STATS_MEAN = [7.648381, 2.564115, 3.064693, 64.199936, 2.807240, 15.470088];
+export const M_STATS_STD = [1.224848, 0.378145, 0.346573, 6.393577, 5.450570, 14.535635];
 
 export const COUNT_COLS = [
   'Count',
