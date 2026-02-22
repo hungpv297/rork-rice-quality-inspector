@@ -1,4 +1,6 @@
 import { Platform } from 'react-native';
+import * as ImageManipulator from 'expo-image-manipulator';
+import * as jpeg from 'jpeg-js';
 import { GrainCounts, KernelShape, ColorProfile, RiceType } from '@/types';
 import {
   MODEL_URL,
@@ -43,6 +45,14 @@ let nativeModelLoadPromise: Promise<any> | null = null;
 let nativeOrt: any = null;
 let nativeOrtAvailable: boolean | null = null;
 
+function tryLoadOnnxRuntimeNative(): any {
+  try {
+    return require('onnxruntime-react-native');
+  } catch {
+    return null;
+  }
+}
+
 let webOrt: any = null;
 let webOrtLoadAttempted = false;
 let cachedWebSession: any = null;
@@ -53,8 +63,13 @@ function getNativeOrt(): any {
   if (nativeOrt) return nativeOrt;
 
   try {
-    const moduleName = 'onnxruntime-react-native';
-    nativeOrt = require(moduleName);
+    const mod = tryLoadOnnxRuntimeNative();
+    if (!mod) {
+      console.log('[Inference] onnxruntime-react-native not available, will use simulation fallback');
+      nativeOrtAvailable = false;
+      return null;
+    }
+    nativeOrt = mod;
     nativeOrtAvailable = true;
     console.log('[Inference] onnxruntime-react-native loaded successfully');
     return nativeOrt;
@@ -165,9 +180,6 @@ async function loadWebSession(): Promise<any> {
 
 async function buildTileTensorNative(imageUri: string): Promise<Float32Array> {
   console.log('[Inference] Preprocessing image (native) via expo-image-manipulator + jpeg-js...');
-
-  const ImageManipulator = require('expo-image-manipulator');
-  const jpeg = require('jpeg-js');
 
   const resized = await ImageManipulator.manipulateAsync(
     imageUri,
